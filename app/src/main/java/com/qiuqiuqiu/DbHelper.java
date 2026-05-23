@@ -182,6 +182,51 @@ class DbHelper extends SQLiteOpenHelper {
         }
     }
 
+    TxRecord transactionRecord(long id) {
+        Cursor c = getReadableDatabase().rawQuery(
+                "SELECT id,type,amount,COALESCE(category_id,0),account_id,COALESCE(target_account_id,0),transaction_time,COALESCE(note,''),COALESCE(reimburse_status,'none') FROM transactions WHERE id=? AND is_deleted=0 LIMIT 1",
+                new String[]{String.valueOf(id)});
+        try {
+            if (c.moveToFirst()) {
+                return new TxRecord(c.getLong(0), c.getString(1), c.getLong(2), c.getLong(3), c.getLong(4),
+                        c.getLong(5), c.getLong(6), c.getString(7), c.getString(8));
+            }
+            return null;
+        } finally {
+            c.close();
+        }
+    }
+
+    void updateTransaction(long id, String type, long amount, long categoryId, long accountId, long targetAccountId, long time, String note, String reimburse) {
+        SQLiteDatabase db = getWritableDatabase();
+        db.beginTransaction();
+        try {
+            Cursor c = db.rawQuery("SELECT type,amount,account_id,COALESCE(target_account_id,0) FROM transactions WHERE id=? AND is_deleted=0", new String[]{String.valueOf(id)});
+            try {
+                if (c.moveToFirst()) applyAccountDelta(db, c.getString(0), c.getLong(1), c.getLong(2), c.getLong(3), -1);
+            } finally {
+                c.close();
+            }
+            ContentValues v = new ContentValues();
+            v.put("type", type);
+            v.put("amount", amount);
+            if (categoryId > 0) v.put("category_id", categoryId);
+            else v.putNull("category_id");
+            v.put("account_id", accountId);
+            if (targetAccountId > 0) v.put("target_account_id", targetAccountId);
+            else v.putNull("target_account_id");
+            v.put("transaction_time", time);
+            v.put("note", note);
+            v.put("reimburse_status", reimburse);
+            v.put("updated_at", System.currentTimeMillis());
+            db.update("transactions", v, "id=?", new String[]{String.valueOf(id)});
+            applyAccountDelta(db, type, amount, accountId, targetAccountId, 1);
+            db.setTransactionSuccessful();
+        } finally {
+            db.endTransaction();
+        }
+    }
+
     void addAttachment(long transactionId, String path) {
         ContentValues v = new ContentValues();
         v.put("transaction_id", transactionId);
@@ -466,6 +511,23 @@ class DbHelper extends SQLiteOpenHelper {
             this.icon = icon;
             this.account = account;
             this.attachments = attachments;
+            this.reimburse = reimburse;
+        }
+    }
+
+    static class TxRecord {
+        final long id, amount, categoryId, accountId, targetAccountId, time;
+        final String type, note, reimburse;
+
+        TxRecord(long id, String type, long amount, long categoryId, long accountId, long targetAccountId, long time, String note, String reimburse) {
+            this.id = id;
+            this.type = type;
+            this.amount = amount;
+            this.categoryId = categoryId;
+            this.accountId = accountId;
+            this.targetAccountId = targetAccountId;
+            this.time = time;
+            this.note = note;
             this.reimburse = reimburse;
         }
     }

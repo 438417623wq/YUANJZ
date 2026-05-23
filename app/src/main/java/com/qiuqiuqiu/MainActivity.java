@@ -30,11 +30,17 @@ import android.os.Bundle;
 import android.os.Build;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.provider.Settings;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
 import android.text.InputType;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.window.OnBackInvokedCallback;
+import android.window.OnBackInvokedDispatcher;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -48,6 +54,7 @@ import android.widget.Toast;
 import android.text.Editable;
 import android.text.TextWatcher;
 
+import android.content.ActivityNotFoundException;
 import java.io.File;
 import java.io.ByteArrayOutputStream;
 import java.io.FileInputStream;
@@ -59,6 +66,8 @@ import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.List;
 import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -69,13 +78,21 @@ public class MainActivity extends Activity {
     private static final int CREATE_BACKUP = 31;
     private static final int IMPORT_BACKUP = 32;
     private static final int RECORD_AUDIO_PERMISSION = 41;
+    private static final int SPEECH_INPUT = 42;
+    private static final int SPEECH_PERMISSION = 43;
     private static final int CUSTOM_CRYSTAL = -1;
     private static final int CUSTOM_BELL = -2;
     private static final int CUSTOM_BIRD = -3;
     private static final int CUSTOM_CAT = -4;
     private static final int CUSTOM_DOG = -5;
-    private static final int CUSTOM_RECORD = -6;
-    private static final String[] SOUND_NAMES = {"清脆提示", "确认提示", "柔和提示", "低沉提示", "数字滴声", "短促滴声", "水晶清脆", "铃铛清脆", "小鸟啾啾", "小猫喵喵", "小狗汪汪", "我的录音"};
+    private static final int CUSTOM_CHIME = -6;
+    private static final int CUSTOM_COIN = -7;
+    private static final int CUSTOM_POP = -8;
+    private static final int CUSTOM_BUBBLE = -9;
+    private static final int CUSTOM_FROG = -10;
+    private static final int CUSTOM_SHEEP = -11;
+    private static final int CUSTOM_RECORD = -12;
+    private static final String[] SOUND_NAMES = {"清脆提示", "确认提示", "柔和提示", "低沉提示", "数字滴声", "短促滴声", "水晶清脆", "铃铛清脆", "星星叮咚", "金币轻响", "软糖弹跳", "泡泡轻点", "小鸟啾啾", "小猫喵喵", "小狗汪汪", "青蛙呱呱", "小羊咩咩", "我的录音"};
     private static final int[] SOUND_TONES = {
             ToneGenerator.TONE_PROP_BEEP,
             ToneGenerator.TONE_PROP_ACK,
@@ -85,9 +102,15 @@ public class MainActivity extends Activity {
             ToneGenerator.TONE_DTMF_5,
             CUSTOM_CRYSTAL,
             CUSTOM_BELL,
+            CUSTOM_CHIME,
+            CUSTOM_COIN,
+            CUSTOM_POP,
+            CUSTOM_BUBBLE,
             CUSTOM_BIRD,
             CUSTOM_CAT,
             CUSTOM_DOG,
+            CUSTOM_FROG,
+            CUSTOM_SHEEP,
             CUSTOM_RECORD
     };
 
@@ -106,6 +129,10 @@ public class MainActivity extends Activity {
     private ToneGenerator tone;
     private MediaRecorder recorder;
     private MediaPlayer customPlayer;
+    private SpeechRecognizer aiSpeechRecognizer;
+    private boolean aiSpeechListening;
+    private boolean aiVoiceRecording;
+    private File lastAiVoiceFile;
     private File currentRecordingFile;
     private String petAction = "idle";
     private long petActionUntil;
@@ -124,6 +151,7 @@ public class MainActivity extends Activity {
     private String statsPeriod = "month";
     private String listKeyword;
     private String listType;
+    private String currentPage = "home";
 
     private final ArrayList<String> pendingImages = new ArrayList<>();
     private EditText amountInput;
@@ -131,6 +159,10 @@ public class MainActivity extends Activity {
     private TextView amountDisplay;
     private TextView timeText;
     private TextView imageHint;
+    private long editingTransactionId;
+    private boolean editingReimburse;
+    private final ArrayList<String> aiMessages = new ArrayList<>();
+    private AiDraft aiDraft;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -143,6 +175,7 @@ public class MainActivity extends Activity {
         selectedTime = System.currentTimeMillis();
         selectedAccount = firstId(db.accounts());
         showShell();
+        registerSystemBackHandler();
         showHome();
     }
 
@@ -154,7 +187,39 @@ public class MainActivity extends Activity {
         }
         stopRecording(false);
         releaseCustomPlayer();
+        stopAiVoiceRecording(false);
+        if (aiSpeechRecognizer != null) {
+            aiSpeechRecognizer.destroy();
+            aiSpeechRecognizer = null;
+        }
         super.onDestroy();
+    }
+
+    @Override
+    public void onBackPressed() {
+        handleBackNavigation();
+    }
+
+    private void registerSystemBackHandler() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                    new OnBackInvokedCallback() {
+                        @Override
+                        public void onBackInvoked() {
+                            handleBackNavigation();
+                        }
+                    }
+            );
+        }
+    }
+
+    private void handleBackNavigation() {
+        if (!"home".equals(currentPage)) {
+            showHome();
+            return;
+        }
+        moveTaskToBack(true);
     }
 
     private void showShell() {
@@ -194,6 +259,7 @@ public class MainActivity extends Activity {
     }
 
     private void showHome() {
+        currentPage = "home";
         LinearLayout page = page("");
         long[] month = monthRange(visibleMonth);
         long income = db.sum("income", month[0], month[1]);
@@ -223,7 +289,7 @@ public class MainActivity extends Activity {
         LinearLayout tools = card();
         tools.setOrientation(LinearLayout.HORIZONTAL);
         tools.addView(shortcut("账单", "明", this::showList), new LinearLayout.LayoutParams(0, dp(86), 1));
-        tools.addView(shortcut("预算", "预", this::askBudget), new LinearLayout.LayoutParams(0, dp(86), 1));
+        tools.addView(shortcut("AI记账", "AI", this::showAiAssistant), new LinearLayout.LayoutParams(0, dp(86), 1));
         tools.addView(shortcut("资产", "资", this::showMine), new LinearLayout.LayoutParams(0, dp(86), 1));
         tools.addView(shortcut("图表", "图", this::showStats), new LinearLayout.LayoutParams(0, dp(86), 1));
         page.addView(tools);
@@ -236,6 +302,8 @@ public class MainActivity extends Activity {
     private void openNewTransaction() {
         pendingImages.clear();
         currentType = "expense";
+        editingTransactionId = 0;
+        editingReimburse = false;
         selectedTime = System.currentTimeMillis();
         selectedTargetAccount = 0;
         selectedCategory = 0;
@@ -247,6 +315,7 @@ public class MainActivity extends Activity {
     }
 
     private void showCategoryPicker() {
+        currentPage = "entry";
         LinearLayout page = page("");
         page.setBackgroundColor(Color.WHITE);
         LinearLayout tabs = topTabs("取消", this::showHome);
@@ -271,6 +340,7 @@ public class MainActivity extends Activity {
     }
 
     private void showEntryForm() {
+        currentPage = "entry";
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.WHITE);
@@ -331,6 +401,10 @@ public class MainActivity extends Activity {
         image.setOnClickListener(v -> pickImage());
         noteBar.addView(image, new LinearLayout.LayoutParams(dp(76), dp(42)));
         Button reimb = outlineButton("待报销");
+        if (editingReimburse) {
+            reimb.setSelected(true);
+            reimb.setText("已标记");
+        }
         reimb.setOnClickListener(v -> {
             reimb.setSelected(!reimb.isSelected());
             reimb.setText(reimb.isSelected() ? "已标记" : "待报销");
@@ -559,15 +633,25 @@ public class MainActivity extends Activity {
             toast("请选择分类");
             return;
         }
-        long id = db.addTransaction(currentType, cents, selectedCategory, selectedAccount, selectedTargetAccount,
-                selectedTime, noteInput.getText().toString().trim(), reimb ? "pending" : "none");
+        long id;
+        if (editingTransactionId > 0) {
+            id = editingTransactionId;
+            db.updateTransaction(id, currentType, cents, selectedCategory, selectedAccount, selectedTargetAccount,
+                    selectedTime, noteInput.getText().toString().trim(), reimb ? "pending" : "none");
+        } else {
+            id = db.addTransaction(currentType, cents, selectedCategory, selectedAccount, selectedTargetAccount,
+                    selectedTime, noteInput.getText().toString().trim(), reimb ? "pending" : "none");
+        }
         for (String path : pendingImages) db.addAttachment(id, path);
-        petReward(pendingImages.size() > 0);
-        toast(petAdopted() ? "已保存，宠物获得成长奖励" : "已保存");
-        showHome();
+        if (editingTransactionId == 0) petReward(pendingImages.size() > 0);
+        toast(editingTransactionId > 0 ? "已更新" : (petAdopted() ? "已保存，宠物获得成长奖励" : "已保存"));
+        editingTransactionId = 0;
+        editingReimburse = false;
+        showList();
     }
 
     private void showList() {
+        currentPage = "list";
         if (listKeyword == null) listKeyword = "";
         renderListPage();
     }
@@ -743,8 +827,40 @@ public class MainActivity extends Activity {
                 .setTitle(DbHelper.typeName(tx.type) + " " + money(tx.amount))
                 .setView(box)
                 .setNegativeButton("关闭", null)
+                .setNeutralButton("编辑", (d, w) -> editTransaction(tx.id))
                 .setPositiveButton("删除", (d, w) -> confirmDelete(tx.id))
                 .show();
+    }
+
+    private void editTransaction(long id) {
+        DbHelper.TxRecord record = db.transactionRecord(id);
+        if (record == null) {
+            toast("账单不存在");
+            return;
+        }
+        pendingImages.clear();
+        editingTransactionId = id;
+        editingReimburse = "pending".equals(record.reimburse);
+        currentType = record.type;
+        selectedCategory = record.categoryId;
+        selectedAccount = record.accountId;
+        selectedTargetAccount = record.targetAccountId;
+        selectedTime = record.time;
+        DbHelper.Item category = categoryById(record.type, record.categoryId);
+        if ("transfer".equals(record.type)) {
+            selectedCategoryName = "转账";
+            selectedCategoryIcon = "转";
+        } else if (category != null) {
+            selectedCategoryName = category.name;
+            selectedCategoryIcon = category.icon;
+        }
+        showEntryForm();
+        amountInput.setText(DbHelper.formatMoney(record.amount));
+        amountDisplay.setText(DbHelper.formatMoney(record.amount));
+        noteInput.setText(record.note);
+        timeText.setText(shortDateLabel(record.time));
+        int oldImages = db.attachmentPaths(id).size();
+        imageHint.setText(oldImages == 0 ? "可继续添加图片" : "已有 " + oldImages + " 张图片，可继续添加");
     }
 
     private void openRecordSound() {
@@ -824,6 +940,7 @@ public class MainActivity extends Activity {
     }
 
     private void showStats() {
+        currentPage = "stats";
         LinearLayout page = page("");
         LinearLayout top = new LinearLayout(this);
         top.setOrientation(LinearLayout.VERTICAL);
@@ -917,6 +1034,7 @@ public class MainActivity extends Activity {
     }
 
     private void showMine() {
+        currentPage = "mine";
         LinearLayout page = page("");
         page.addView(mineHero());
         page.addView(sectionTitle("账户"));
@@ -941,16 +1059,21 @@ public class MainActivity extends Activity {
     }
 
     private void showPet() {
+        currentPage = "pet";
         LinearLayout page = page("宠物");
         if (!petAdopted()) {
             page.addView(petIntroCard());
             page.addView(sectionTitle("选择你的记账伙伴"));
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.addView(petAdoptCard("cat", "小秋猫", Color.rgb(255, 234, 217)), new LinearLayout.LayoutParams(0, dp(190), 1));
-            row.addView(petAdoptCard("dog", "小秋狗", Color.rgb(229, 246, 239)), new LinearLayout.LayoutParams(0, dp(190), 1));
-            row.addView(petAdoptCard("rabbit", "小秋兔", Color.rgb(240, 233, 255)), new LinearLayout.LayoutParams(0, dp(190), 1));
-            page.addView(row);
+            page.addView(petAdoptRow(
+                    petAdoptCard("cat", "小秋猫", Color.rgb(255, 234, 217)),
+                    petAdoptCard("dog", "小秋狗", Color.rgb(229, 246, 239)),
+                    petAdoptCard("rabbit", "小秋兔", Color.rgb(240, 233, 255))
+            ));
+            page.addView(petAdoptRow(
+                    petAdoptCard("fox", "小秋狐", Color.rgb(255, 236, 218)),
+                    petAdoptCard("panda", "小秋熊猫", Color.rgb(235, 239, 240)),
+                    petAdoptCard("hamster", "小秋仓鼠", Color.rgb(255, 242, 207))
+            ));
             setPage(page);
             return;
         }
@@ -981,6 +1104,489 @@ public class MainActivity extends Activity {
         setPage(page);
     }
 
+    private void showAiAssistant() {
+        currentPage = "ai";
+        if (aiVoiceRecording) stopAiVoiceRecording(false);
+        if (aiSpeechListening) stopAiSpeechInput();
+        if (aiMessages.isEmpty()) {
+            aiMessages.add("AI：你可以直接说：今天午饭28微信支付，或 昨天工资到账5000。");
+        }
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(bg);
+        root.setPadding(0, statusBarHeight(), 0, 0);
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(12), 0, dp(12), 0);
+        header.setBackgroundColor(yellow);
+        Button back = outlineButton("<");
+        back.setBackgroundColor(yellow);
+        back.setOnClickListener(v -> showHome());
+        Button home = outlineButton("首页");
+        home.setBackgroundColor(yellow);
+        home.setOnClickListener(v -> showHome());
+        TextView title = label("AI记账助手", 20, ink, true);
+        title.setGravity(Gravity.CENTER);
+        header.addView(back, new LinearLayout.LayoutParams(dp(54), dp(56)));
+        header.addView(title, new LinearLayout.LayoutParams(0, dp(56), 1));
+        header.addView(home, new LinearLayout.LayoutParams(dp(64), dp(56)));
+        root.addView(header);
+
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout messages = new LinearLayout(this);
+        messages.setOrientation(LinearLayout.VERTICAL);
+        messages.setPadding(dp(12), dp(12), dp(12), dp(12));
+        scroll.addView(messages);
+        LinearLayout tips = card();
+        tips.addView(label("本地 AI 规则解析，不联网。识别后需要你确认才会保存。", 14, muted, false));
+        messages.addView(tips);
+        for (String msg : aiMessages) {
+            if (!msg.startsWith("VOICE:")) messages.addView(aiBubble(msg));
+        }
+        if (aiDraft != null) messages.addView(aiDraftCard());
+        root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+
+        LinearLayout inputBar = new LinearLayout(this);
+        inputBar.setOrientation(LinearLayout.HORIZONTAL);
+        inputBar.setGravity(Gravity.CENTER_VERTICAL);
+        inputBar.setPadding(dp(8), dp(8), dp(8), dp(12));
+        inputBar.setBackgroundColor(Color.WHITE);
+        EditText input = new EditText(this);
+        input.setHint("输入一句记账内容");
+        input.setSingleLine(true);
+        input.setBackground(round(soft, dp(22)));
+        input.setPadding(dp(14), 0, dp(14), 0);
+        inputBar.addView(input, new LinearLayout.LayoutParams(0, dp(48), 1));
+        Button send = primaryButton("发送");
+        send.setOnClickListener(v -> {
+            String text = input.getText().toString().trim();
+            if (text.length() == 0) return;
+            aiHandleUserText(text);
+        });
+        inputBar.addView(send, new LinearLayout.LayoutParams(dp(82), dp(48)));
+        root.addView(inputBar);
+        setContent(root);
+    }
+
+    private View aiBubble(String text) {
+        TextView tv = label(text, 15, text.startsWith("我：") ? ink : muted, false);
+        tv.setPadding(dp(12), dp(10), dp(12), dp(10));
+        tv.setBackground(round(text.startsWith("我：") ? Color.rgb(255, 248, 222) : Color.WHITE, dp(8)));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+        lp.setMargins(0, dp(4), 0, dp(4));
+        tv.setLayoutParams(lp);
+        return tv;
+    }
+
+    private View aiVoiceBubble(String path) {
+        LinearLayout box = card();
+        box.setBackground(round(Color.rgb(255, 248, 222), dp(8)));
+        box.addView(label("我：语音消息", 15, ink, true));
+        box.addView(label(new File(path).exists() ? "已保存到 APP 本地，点击播放。" : "语音文件不存在", 13, muted, false));
+        Button play = outlineButton("播放语音");
+        play.setOnClickListener(v -> playAudioFile(path));
+        box.addView(play, new LinearLayout.LayoutParams(-1, dp(44)));
+        return box;
+    }
+
+    private View aiSpeechSetupCard() {
+        LinearLayout card = card();
+        card.setBackground(round(Color.rgb(255, 249, 226), dp(8)));
+        card.addView(label("语音转文字未开启", 17, ink, true));
+        card.addView(label("当前手机没有可调用的系统语音识别服务。现在点击底部“语音”会先录音保存；开启语音输入服务后可自动转文字。", 14, muted, false));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        Button settings = primaryButton("去开启");
+        settings.setOnClickListener(v -> openVoiceInputSettings());
+        Button text = outlineButton("用文字");
+        text.setOnClickListener(v -> toast("可以直接在底部输入一句记账内容"));
+        row.addView(settings, new LinearLayout.LayoutParams(0, dp(46), 1));
+        row.addView(text, new LinearLayout.LayoutParams(0, dp(46), 1));
+        card.addView(row);
+        return card;
+    }
+
+    private View aiDraftCard() {
+        LinearLayout card = card();
+        card.addView(label("识别结果", 17, ink, true));
+        card.addView(label(aiDraftSummary(aiDraft), 15, ink, false));
+        if (aiDraft.ready) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            Button save = primaryButton("保存账单");
+            save.setOnClickListener(v -> saveAiDraft());
+            Button cancel = outlineButton("取消");
+            cancel.setOnClickListener(v -> {
+                aiDraft = null;
+                aiMessages.add("AI：已取消这次识别。");
+                showAiAssistant();
+            });
+            row.addView(save, new LinearLayout.LayoutParams(0, dp(48), 1));
+            row.addView(cancel, new LinearLayout.LayoutParams(0, dp(48), 1));
+            card.addView(row);
+        } else {
+            card.addView(label("还需要补充：" + aiDraft.missing, 14, red, false));
+        }
+        return card;
+    }
+
+    private void aiHandleUserText(String text) {
+        aiMessages.add("我：" + text);
+        aiDraft = parseAiDraft(text);
+        aiMessages.add(aiDraft.ready ? "AI：我已识别出一笔账单，请确认后保存。" : "AI：我还没识别完整，可以换一种说法补充金额、账户或转入账户。");
+        showAiAssistant();
+    }
+
+    private void startAiSpeechInput() {
+        if (Build.VERSION.SDK_INT >= 23 && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, SPEECH_PERMISSION);
+            return;
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            toggleAiVoiceRecording();
+            return;
+        }
+        if (aiSpeechListening) {
+            stopAiSpeechInput();
+            return;
+        }
+        if (aiVoiceRecording) {
+            stopAiVoiceRecording(true);
+            return;
+        }
+        if (aiSpeechRecognizer == null) {
+            aiSpeechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+            aiSpeechRecognizer.setRecognitionListener(new RecognitionListener() {
+                @Override public void onReadyForSpeech(Bundle params) {
+                    toast("正在听，请说出记账内容");
+                }
+                @Override public void onBeginningOfSpeech() {}
+                @Override public void onRmsChanged(float rmsdB) {}
+                @Override public void onBufferReceived(byte[] buffer) {}
+                @Override public void onEndOfSpeech() {
+                    aiSpeechListening = false;
+                    toast("正在转文字");
+                }
+                @Override public void onError(int error) {
+                    aiSpeechListening = false;
+                    toast(aiSpeechErrorText(error));
+                }
+                @Override public void onResults(Bundle results) {
+                    aiSpeechListening = false;
+                    ArrayList<String> texts = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                    if (texts != null && !texts.isEmpty()) {
+                        aiHandleUserText(texts.get(0));
+                    } else {
+                        toast("没有识别到语音内容");
+                    }
+                }
+                @Override public void onPartialResults(Bundle partialResults) {}
+                @Override public void onEvent(int eventType, Bundle params) {}
+            });
+        }
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.CHINA.toString());
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "zh-CN");
+        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+        aiSpeechListening = true;
+        try {
+            aiSpeechRecognizer.startListening(intent);
+        } catch (Exception e) {
+            aiSpeechListening = false;
+            toast("语音转文字启动失败，可先用文字输入");
+        }
+    }
+
+    private void stopAiSpeechInput() {
+        if (aiSpeechRecognizer != null) {
+            aiSpeechRecognizer.stopListening();
+        }
+        aiSpeechListening = false;
+        toast("已停止语音输入");
+    }
+
+    private void toggleAiVoiceRecording() {
+        if (aiVoiceRecording) {
+            stopAiVoiceRecording(true);
+        } else {
+            startAiVoiceRecording();
+        }
+    }
+
+    private void startAiVoiceRecording() {
+        try {
+            stopRecording(false);
+            releaseCustomPlayer();
+            File dir = new File(getFilesDir(), "ai_voice");
+            if (!dir.exists()) dir.mkdirs();
+            lastAiVoiceFile = new File(dir, "ai_voice_" + System.currentTimeMillis() + ".m4a");
+            currentRecordingFile = lastAiVoiceFile;
+            recorder = new MediaRecorder();
+            recorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            recorder.setAudioEncodingBitRate(96000);
+            recorder.setAudioSamplingRate(44100);
+            recorder.setOutputFile(lastAiVoiceFile.getAbsolutePath());
+            recorder.prepare();
+            recorder.start();
+            aiVoiceRecording = true;
+            toast("已开始录音，再点一次停止");
+            showAiAssistant();
+        } catch (Exception e) {
+            aiVoiceRecording = false;
+            stopRecording(false);
+            toast("录音启动失败，请检查麦克风权限");
+        }
+    }
+
+    private void stopAiVoiceRecording(boolean keepFile) {
+        if (!aiVoiceRecording && recorder == null) return;
+        File file = lastAiVoiceFile;
+        try {
+            if (recorder != null) recorder.stop();
+        } catch (Exception ignored) {
+        }
+        try {
+            if (recorder != null) recorder.release();
+        } catch (Exception ignored) {
+        }
+        recorder = null;
+        aiVoiceRecording = false;
+        currentRecordingFile = null;
+        if (keepFile && file != null && file.exists() && file.length() > 0) {
+            aiMessages.add("VOICE:" + file.getAbsolutePath());
+            aiMessages.add("AI：当前设备没有语音转文字服务，我已先保存语音。你可以继续用文字补充金额、分类和账户。");
+            toast("语音已保存");
+            showAiAssistant();
+        } else if (file != null && file.exists()) {
+            file.delete();
+        }
+    }
+
+    private void playAudioFile(String path) {
+        File file = new File(path);
+        if (!file.exists()) {
+            toast("语音文件不存在");
+            return;
+        }
+        try {
+            releaseCustomPlayer();
+            customPlayer = new MediaPlayer();
+            customPlayer.setDataSource(file.getAbsolutePath());
+            customPlayer.setOnCompletionListener(mp -> releaseCustomPlayer());
+            customPlayer.prepare();
+            customPlayer.start();
+        } catch (Exception e) {
+            releaseCustomPlayer();
+            toast("语音播放失败");
+        }
+    }
+
+    private String aiSpeechErrorText(int error) {
+        if (error == SpeechRecognizer.ERROR_AUDIO) return "麦克风录音失败，请检查权限";
+        if (error == SpeechRecognizer.ERROR_CLIENT) return "语音服务暂不可用，请稍后重试";
+        if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) return "需要麦克风权限才能语音记账";
+        if (error == SpeechRecognizer.ERROR_NETWORK || error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT) return "语音服务网络异常，可先用文字输入";
+        if (error == SpeechRecognizer.ERROR_NO_MATCH) return "没有听清楚，请再说一次";
+        if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) return "语音识别正忙，请稍后再试";
+        if (error == SpeechRecognizer.ERROR_SERVER) return "语音识别服务异常，可先用文字输入";
+        if (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) return "没有听到声音，请再试一次";
+        return "语音转文字失败，可先用文字输入";
+    }
+
+    private void showSpeechServiceMissingDialog() {
+        new AlertDialog.Builder(this)
+                .setTitle("需要开启语音转文字")
+                .setMessage("当前手机没有可调用的系统语音识别服务。请在系统里开启语音输入，或安装手机厂商/Google 的语音识别服务。开启后回到这里再点“语音”。")
+                .setNegativeButton("先用文字", null)
+                .setPositiveButton("去开启", (d, w) -> openVoiceInputSettings())
+                .show();
+    }
+
+    private void openVoiceInputSettings() {
+        if (startSettingsIntent(Settings.ACTION_VOICE_INPUT_SETTINGS)) return;
+        if (startSettingsIntent(Settings.ACTION_INPUT_METHOD_SETTINGS)) return;
+        startSettingsIntent(Settings.ACTION_SETTINGS);
+    }
+
+    private boolean startSettingsIntent(String action) {
+        try {
+            Intent intent = new Intent(action);
+            startActivity(intent);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private String aiDraftSummary(AiDraft d) {
+        return "类型：" + typeText(d.type) +
+                "\n金额：" + money(d.amount) +
+                "\n分类：" + ("transfer".equals(d.type) ? "转账" : d.categoryName) +
+                "\n账户：" + accountName(d.accountId) +
+                ("transfer".equals(d.type) ? "\n转入：" + accountName(d.targetAccountId) : "") +
+                "\n时间：" + formatDateTime(d.time) +
+                "\n备注：" + d.note;
+    }
+
+    private void saveAiDraft() {
+        if (aiDraft == null || !aiDraft.ready) return;
+        db.addTransaction(aiDraft.type, aiDraft.amount, aiDraft.categoryId, aiDraft.accountId, aiDraft.targetAccountId,
+                aiDraft.time, aiDraft.note, "none");
+        petReward(false);
+        aiMessages.add("AI：已保存到账本。");
+        aiDraft = null;
+        showAiAssistant();
+    }
+
+    private AiDraft parseAiDraft(String text) {
+        AiDraft d = new AiDraft();
+        d.raw = text;
+        d.note = text;
+        d.time = parseAiTime(text);
+        d.amount = parseAiAmount(text);
+        d.type = parseAiType(text);
+        d.accountId = matchAccount(text, false);
+        if (d.accountId == 0) d.accountId = selectedAccount == 0 ? firstId(db.accounts()) : selectedAccount;
+        if ("transfer".equals(d.type)) {
+            d.targetAccountId = matchAccount(text, true);
+            if (d.targetAccountId == 0 || d.targetAccountId == d.accountId) d.targetAccountId = firstDifferentAccount(d.accountId);
+            d.categoryName = "转账";
+        } else {
+            DbHelper.Item category = matchCategory(text, d.type);
+            if (category != null) {
+                d.categoryId = category.id;
+                d.categoryName = category.name;
+            }
+        }
+        ArrayList<String> miss = new ArrayList<>();
+        if (d.amount <= 0) miss.add("金额");
+        if (d.accountId == 0) miss.add("账户");
+        if ("transfer".equals(d.type)) {
+            if (d.targetAccountId == 0 || d.targetAccountId == d.accountId) miss.add("不同的转入账户");
+        } else if (d.categoryId == 0) {
+            miss.add("分类");
+        }
+        d.ready = miss.isEmpty();
+        d.missing = miss.isEmpty() ? "" : join(miss, "、");
+        return d;
+    }
+
+    private long parseAiAmount(String text) {
+        Matcher m = Pattern.compile("(\\d+(?:\\.\\d{1,2})?)").matcher(text);
+        if (m.find()) return parseAmount(m.group(1));
+        return 0;
+    }
+
+    private String parseAiType(String text) {
+        if (containsAny(text, "转账", "转到", "转入", "转给")) return "transfer";
+        if (containsAny(text, "工资", "到账", "收入", "奖金", "红包", "报销", "退款", "兼职", "理财", "收益", "收到")) return "income";
+        return "expense";
+    }
+
+    private long parseAiTime(String text) {
+        Calendar c = Calendar.getInstance();
+        if (text.contains("前天")) c.add(Calendar.DAY_OF_MONTH, -2);
+        else if (text.contains("昨天") || text.contains("昨日")) c.add(Calendar.DAY_OF_MONTH, -1);
+        if (text.contains("早上") || text.contains("上午") || text.contains("早餐")) {
+            c.set(Calendar.HOUR_OF_DAY, 8);
+            c.set(Calendar.MINUTE, 0);
+        } else if (text.contains("中午") || text.contains("午饭")) {
+            c.set(Calendar.HOUR_OF_DAY, 12);
+            c.set(Calendar.MINUTE, 0);
+        } else if (text.contains("晚上") || text.contains("晚饭") || text.contains("夜宵")) {
+            c.set(Calendar.HOUR_OF_DAY, 19);
+            c.set(Calendar.MINUTE, 0);
+        }
+        c.set(Calendar.SECOND, 0);
+        c.set(Calendar.MILLISECOND, 0);
+        return c.getTimeInMillis();
+    }
+
+    private DbHelper.Item matchCategory(String text, String type) {
+        String target = categoryNameByKeyword(text, type);
+        List<DbHelper.Item> list = db.categories(type);
+        if (target != null) {
+            for (DbHelper.Item item : list) if (item.name.equals(target)) return item;
+        }
+        for (DbHelper.Item item : list) if (text.contains(item.name)) return item;
+        return list.isEmpty() ? null : list.get(list.size() - 1);
+    }
+
+    private String categoryNameByKeyword(String text, String type) {
+        if ("income".equals(type)) {
+            if (containsAny(text, "工资", "薪水")) return "工资";
+            if (containsAny(text, "兼职", "外快")) return "兼职";
+            if (containsAny(text, "理财", "收益", "利息")) return "理财";
+            if (containsAny(text, "奖金", "绩效")) return "奖金";
+            if (containsAny(text, "红包")) return "红包";
+            if (containsAny(text, "报销")) return "报销";
+            if (containsAny(text, "退款", "退回")) return "退款";
+            if (containsAny(text, "礼金")) return "礼金";
+            return "其他";
+        }
+        if (containsAny(text, "吃", "餐", "饭", "早餐", "午饭", "晚饭", "咖啡", "奶茶", "外卖")) return "餐饮";
+        if (containsAny(text, "买菜", "蔬菜")) return "蔬菜";
+        if (containsAny(text, "水果")) return "水果";
+        if (containsAny(text, "零食")) return "零食";
+        if (containsAny(text, "购物", "淘宝", "京东", "买了")) return "购物";
+        if (containsAny(text, "地铁", "公交", "打车", " taxi", "车费", "交通")) return "交通";
+        if (containsAny(text, "房租", "房贷", "住房")) return "住房";
+        if (containsAny(text, "水电", "日用", "纸巾")) return "日用";
+        if (containsAny(text, "衣服", "鞋", "服饰")) return "服饰";
+        if (containsAny(text, "医院", "药", "医疗")) return "医疗";
+        if (containsAny(text, "书", "课程", "学习")) return "学习";
+        if (containsAny(text, "电影", "游戏", "娱乐")) return "娱乐";
+        if (containsAny(text, "电话", "话费", "流量", "通讯")) return "通讯";
+        return "其他";
+    }
+
+    private long matchAccount(String text, boolean target) {
+        List<DbHelper.Item> list = db.accounts();
+        String sourceText = text;
+        if (target) {
+            int idx = Math.max(Math.max(text.indexOf("转到"), text.indexOf("转入")), text.indexOf("到"));
+            if (idx >= 0) sourceText = text.substring(idx);
+        }
+        for (DbHelper.Item item : list) {
+            if (sourceText.contains(item.name)) return item.id;
+        }
+        if (sourceText.contains("微信")) return accountIdByKeyword("微信");
+        if (sourceText.contains("支付宝")) return accountIdByKeyword("支付宝");
+        if (sourceText.contains("现金")) return accountIdByKeyword("现金");
+        if (sourceText.contains("银行卡") || sourceText.contains("银行")) return accountIdByKeyword("银行卡");
+        if (sourceText.contains("信用卡")) return accountIdByKeyword("信用卡");
+        return 0;
+    }
+
+    private long accountIdByKeyword(String keyword) {
+        for (DbHelper.Item item : db.accounts()) if (item.name.contains(keyword) || keyword.contains(item.name)) return item.id;
+        return 0;
+    }
+
+    private String accountName(long id) {
+        for (DbHelper.Item item : db.accounts()) if (item.id == id) return item.name;
+        return "未识别";
+    }
+
+    private boolean containsAny(String text, String... keys) {
+        for (String key : keys) if (text.contains(key)) return true;
+        return false;
+    }
+
+    private String join(List<String> list, String sep) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < list.size(); i++) {
+            if (i > 0) sb.append(sep);
+            sb.append(list.get(i));
+        }
+        return sb.toString();
+    }
+
     private View petIntroCard() {
         LinearLayout card = card();
         TextView title = label("领养一只记账伙伴", 22, ink, true);
@@ -990,6 +1596,15 @@ public class MainActivity extends Activity {
         sub.setGravity(Gravity.CENTER);
         card.addView(sub, new LinearLayout.LayoutParams(-1, dp(40)));
         return card;
+    }
+
+    private View petAdoptRow(View a, View b, View c) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(a, new LinearLayout.LayoutParams(0, dp(190), 1));
+        row.addView(b, new LinearLayout.LayoutParams(0, dp(190), 1));
+        row.addView(c, new LinearLayout.LayoutParams(0, dp(190), 1));
+        return row;
     }
 
     private View petAdoptCard(String type, String name, int bgColor) {
@@ -1150,41 +1765,101 @@ public class MainActivity extends Activity {
     }
 
     private void showSettings() {
+        currentPage = "settings";
         LinearLayout page = page("设置");
-        Button sound = outlineButton("按键音效：" + (soundEnabled() ? "开" : "关"));
-        sound.setOnClickListener(v -> {
+        page.addView(settingsHero());
+        page.addView(sectionTitle("音效设置"));
+        LinearLayout soundCard = card();
+        soundCard.addView(settingRow("效", Color.rgb(255, 238, 170), "按键音效", soundEnabled() ? "已开启，点击可关闭" : "已关闭，点击可开启", soundEnabled() ? "开" : "关", () -> {
             boolean next = !soundEnabled();
             prefs.edit().putBoolean("sound_enabled", next).apply();
             toast(next ? "按键音效已开启" : "按键音效已关闭");
             showSettings();
-        });
-        page.addView(sectionTitle("音效设置"));
-        page.addView(sound, new LinearLayout.LayoutParams(-1, dp(50)));
-        Button chooseSound = outlineButton("按键音色：" + soundName());
-        chooseSound.setOnClickListener(v -> chooseSoundTone());
-        page.addView(chooseSound, new LinearLayout.LayoutParams(-1, dp(50)));
-        Button recordSound = outlineButton("录制按键音效");
-        recordSound.setOnClickListener(v -> openRecordSound());
-        page.addView(recordSound, new LinearLayout.LayoutParams(-1, dp(50)));
-        Button vibration = outlineButton("按键震动：" + (vibrationEnabled() ? "开" : "关"));
-        vibration.setOnClickListener(v -> {
+        }));
+        soundCard.addView(settingDivider());
+        soundCard.addView(settingRow("音", Color.rgb(229, 246, 239), "按键音色", "内置 " + (SOUND_NAMES.length - 1) + " 种音色，可试听切换", soundName(), this::chooseSoundTone));
+        soundCard.addView(settingDivider());
+        soundCard.addView(settingRow("录", Color.rgb(236, 241, 255), "录制按键音效", "录一段自己的提示音并设为按键音", "录制", this::openRecordSound));
+        soundCard.addView(settingDivider());
+        soundCard.addView(settingRow("震", Color.rgb(255, 232, 238), "按键震动", vibrationEnabled() ? "点击按钮时会轻微震动" : "关闭后点击只保留视觉反馈", vibrationEnabled() ? "开" : "关", () -> {
             boolean next = !vibrationEnabled();
             prefs.edit().putBoolean("vibration_enabled", next).apply();
             if (next) playClickVibration();
             toast(next ? "按键震动已开启" : "按键震动已关闭");
             showSettings();
-        });
-        page.addView(vibration, new LinearLayout.LayoutParams(-1, dp(50)));
+        }));
+        page.addView(soundCard);
 
         page.addView(sectionTitle("备份设置"));
-        Button exportBackup = outlineButton("导出完整备份");
-        exportBackup.setOnClickListener(v -> createBackupDocument());
-        page.addView(exportBackup, new LinearLayout.LayoutParams(-1, dp(50)));
-        Button importBackup = outlineButton("导入完整备份");
-        importBackup.setOnClickListener(v -> confirmImportBackup());
-        page.addView(importBackup, new LinearLayout.LayoutParams(-1, dp(50)));
-        page.addView(label("完整备份包含账单、分类、账户、预算和本地图片。导入会覆盖当前本机数据。", 14, muted, false));
+        LinearLayout backupCard = card();
+        backupCard.addView(settingRow("出", Color.rgb(230, 241, 255), "导出完整备份", "账单、分类、账户、预算、本地图片一起导出", "导出", this::createBackupDocument));
+        backupCard.addView(settingDivider());
+        backupCard.addView(settingRow("入", Color.rgb(235, 245, 232), "导入完整备份", "导入会覆盖当前本机数据，请先确认文件来源", "导入", this::confirmImportBackup));
+        page.addView(backupCard);
+        TextView tip = label("完整备份包含账单、分类、账户、预算和本地图片。导入会覆盖当前本机数据。", 14, muted, false);
+        tip.setPadding(dp(4), dp(4), dp(4), dp(12));
+        page.addView(tip);
         setPage(page);
+    }
+
+    private View settingsHero() {
+        LinearLayout hero = new LinearLayout(this);
+        hero.setOrientation(LinearLayout.VERTICAL);
+        hero.setPadding(dp(18), dp(16), dp(18), dp(16));
+        hero.setBackground(round(yellow, dp(8)));
+        TextView title = label("设置中心", 24, ink, true);
+        hero.addView(title, new LinearLayout.LayoutParams(-1, dp(34)));
+        TextView sub = label("音效、震动和完整备份都在这里管理。", 14, ink, false);
+        hero.addView(sub, new LinearLayout.LayoutParams(-1, dp(28)));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(settingsPill("音效", soundEnabled() ? "开" : "关"), new LinearLayout.LayoutParams(0, dp(54), 1));
+        row.addView(settingsPill("音色", soundName()), new LinearLayout.LayoutParams(0, dp(54), 1));
+        row.addView(settingsPill("震动", vibrationEnabled() ? "开" : "关"), new LinearLayout.LayoutParams(0, dp(54), 1));
+        hero.addView(row);
+        return hero;
+    }
+
+    private TextView settingsPill(String title, String value) {
+        TextView tv = label(title + "\n" + value, 13, ink, false);
+        tv.setGravity(Gravity.CENTER);
+        tv.setBackground(round(Color.argb(130, 255, 255, 255), dp(6)));
+        return tv;
+    }
+
+    private View settingRow(String icon, int iconBg, String title, String sub, String value, Runnable action) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(8), 0, dp(8));
+        TextView badge = label(icon, 16, ink, true);
+        badge.setGravity(Gravity.CENTER);
+        badge.setBackground(circle(iconBg, iconBg));
+        row.addView(badge, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        LinearLayout text = new LinearLayout(this);
+        text.setOrientation(LinearLayout.VERTICAL);
+        text.setPadding(dp(12), 0, dp(8), 0);
+        text.addView(label(title, 16, ink, true), new LinearLayout.LayoutParams(-1, dp(24)));
+        text.addView(label(sub, 12, muted, false), new LinearLayout.LayoutParams(-1, dp(22)));
+        row.addView(text, new LinearLayout.LayoutParams(0, dp(50), 1));
+        TextView state = label(value, 14, muted, false);
+        state.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+        row.addView(state, new LinearLayout.LayoutParams(dp(86), dp(50)));
+        TextView arrow = label(">", 18, muted, false);
+        arrow.setGravity(Gravity.CENTER);
+        row.addView(arrow, new LinearLayout.LayoutParams(dp(18), dp(50)));
+        touchable(row);
+        row.setOnClickListener(v -> action.run());
+        return row;
+    }
+
+    private View settingDivider() {
+        View v = new View(this);
+        v.setBackgroundColor(line);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, 1);
+        lp.setMargins(dp(56), 0, 0, 0);
+        v.setLayoutParams(lp);
+        return v;
     }
 
     private void chooseSoundTone() {
@@ -1549,6 +2224,11 @@ public class MainActivity extends Activity {
         if (requestCode == IMPORT_BACKUP && resultCode == RESULT_OK && data != null && data.getData() != null) {
             importFullBackup(data.getData());
         }
+        if (requestCode == SPEECH_INPUT && resultCode == RESULT_OK && data != null) {
+            ArrayList<String> results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+            if (results != null && !results.isEmpty()) aiHandleUserText(results.get(0));
+            else toast("没有识别到语音内容");
+        }
     }
 
     @Override
@@ -1557,6 +2237,10 @@ public class MainActivity extends Activity {
         if (requestCode == RECORD_AUDIO_PERMISSION) {
             if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) showRecordSoundDialog();
             else toast("需要麦克风权限才能录制音效");
+        }
+        if (requestCode == SPEECH_PERMISSION) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) startAiSpeechInput();
+            else toast("需要麦克风权限才能语音记账");
         }
     }
 
@@ -2098,12 +2782,24 @@ public class MainActivity extends Activity {
             try {
                 if (code == CUSTOM_CRYSTAL) playWave(new double[]{1760, 2349, 3136}, new int[]{28, 34, 42}, 0.55);
                 else if (code == CUSTOM_BELL) playWave(new double[]{1568, 2093, 2637}, new int[]{45, 55, 65}, 0.5);
+                else if (code == CUSTOM_CHIME) playWave(new double[]{1976, 2637, 3520, 2637}, new int[]{24, 30, 38, 42}, 0.48);
+                else if (code == CUSTOM_COIN) playWave(new double[]{1661, 2217, 2959}, new int[]{18, 24, 52}, 0.6);
+                else if (code == CUSTOM_POP) playSweep(520, 980, 62, 0.5, false);
+                else if (code == CUSTOM_BUBBLE) playWave(new double[]{900, 1240, 1680}, new int[]{32, 30, 34}, 0.38);
                 else if (code == CUSTOM_BIRD) playWave(new double[]{2600, 3300, 2800, 3600}, new int[]{22, 24, 20, 26}, 0.5);
                 else if (code == CUSTOM_CAT) playSweep(760, 1120, 140, 0.48, true);
                 else if (code == CUSTOM_DOG) {
                     playSweep(420, 260, 70, 0.62, false);
                     Thread.sleep(35);
                     playSweep(360, 230, 65, 0.55, false);
+                } else if (code == CUSTOM_FROG) {
+                    playSweep(260, 190, 95, 0.56, true);
+                    Thread.sleep(30);
+                    playSweep(310, 210, 82, 0.45, true);
+                } else if (code == CUSTOM_SHEEP) {
+                    playSweep(520, 690, 130, 0.44, true);
+                    Thread.sleep(20);
+                    playSweep(660, 500, 110, 0.38, true);
                 }
             } catch (Exception ignored) {
             }
@@ -2192,6 +2888,13 @@ public class MainActivity extends Activity {
             if (item.id != accountId) return item.id;
         }
         return 0;
+    }
+
+    private DbHelper.Item categoryById(String type, long id) {
+        for (DbHelper.Item item : db.categories(type)) {
+            if (item.id == id) return item;
+        }
+        return null;
     }
 
     private long[] monthRange(Calendar base) {
@@ -2584,8 +3287,8 @@ public class MainActivity extends Activity {
             paint.setColor(Color.argb(42, 40, 45, 52));
             canvas.drawOval(new RectF(cx - dp(62), h - dp(42), cx + dp(62), h - dp(20)), paint);
 
-            int base = "dog".equals(type) ? Color.rgb(221, 165, 95) : ("rabbit".equals(type) ? Color.rgb(248, 248, 244) : Color.rgb(244, 188, 112));
-            int detailColor = "dog".equals(type) ? Color.rgb(105, 72, 48) : ("rabbit".equals(type) ? Color.rgb(214, 128, 170) : Color.rgb(106, 74, 48));
+            int base = petBaseColor();
+            int detailColor = petDetailColor();
             int dark = darken(base, 28);
             int light = lighten(base, 34);
 
@@ -2635,11 +3338,23 @@ public class MainActivity extends Activity {
             } else {
                 canvas.drawArc(new RectF(cx - dp(12), cy + dp(20), cx + dp(12), cy + dp(36)), 200, 140, false, paint);
             }
-            if ("cat".equals(type)) {
+            if ("cat".equals(type) || "fox".equals(type)) {
                 canvas.drawLine(cx - dp(26), cy + dp(8), cx - dp(48), cy + dp(2), paint);
                 canvas.drawLine(cx - dp(26), cy + dp(16), cx - dp(48), cy + dp(18), paint);
                 canvas.drawLine(cx + dp(26), cy + dp(8), cx + dp(48), cy + dp(2), paint);
                 canvas.drawLine(cx + dp(26), cy + dp(16), cx + dp(48), cy + dp(18), paint);
+            }
+            if ("panda".equals(type)) {
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(Color.rgb(40, 45, 48));
+                canvas.drawOval(new RectF(cx - dp(34), cy - dp(20), cx - dp(8), cy + dp(4)), paint);
+                canvas.drawOval(new RectF(cx + dp(8), cy - dp(20), cx + dp(34), cy + dp(4)), paint);
+                paint.setColor(Color.WHITE);
+                canvas.drawCircle(cx - dp(18), cy - dp(6), dp(5), paint);
+                canvas.drawCircle(cx + dp(18), cy - dp(6), dp(5), paint);
+                paint.setColor(Color.rgb(38, 45, 52));
+                canvas.drawCircle(cx - dp(18), cy - dp(6), dp(3), paint);
+                canvas.drawCircle(cx + dp(18), cy - dp(6), dp(3), paint);
             }
             paint.setStyle(Paint.Style.FILL);
             paint.setColor(Color.argb(85, 213, 95, 138));
@@ -2683,12 +3398,21 @@ public class MainActivity extends Activity {
             paint.setColor(darken(base, 18));
             if ("cat".equals(type)) {
                 canvas.drawArc(new RectF(cx + dp(34), cy + dp(18), cx + dp(92), cy + dp(78)), 130, -235, false, paint);
+            } else if ("fox".equals(type)) {
+                paint.setStrokeWidth(dp(18));
+                canvas.drawArc(new RectF(cx + dp(32), cy + dp(18), cx + dp(102), cy + dp(82)), 130, -220, false, paint);
+                paint.setColor(Color.rgb(255, 250, 232));
+                canvas.drawCircle(cx + dp(88), cy + dp(34), dp(10), paint);
             } else if ("dog".equals(type)) {
                 canvas.drawArc(new RectF(cx + dp(34), cy + dp(22), cx + dp(84), cy + dp(68)), 180, 180, false, paint);
-            } else {
+            } else if ("rabbit".equals(type) || "hamster".equals(type)) {
                 paint.setStyle(Paint.Style.FILL);
-                paint.setColor(Color.rgb(245, 245, 245));
+                paint.setColor("hamster".equals(type) ? lighten(base, 20) : Color.rgb(245, 245, 245));
                 canvas.drawCircle(cx + dp(44), cy + dp(58), dp(13), paint);
+            } else if ("panda".equals(type)) {
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(Color.rgb(40, 45, 48));
+                canvas.drawCircle(cx + dp(44), cy + dp(58), dp(10), paint);
             }
             paint.setStyle(Paint.Style.FILL);
         }
@@ -2753,7 +3477,7 @@ public class MainActivity extends Activity {
         }
 
         private void drawEars(Canvas canvas, float cx, float cy, int base, int light, int dark, int detailColor) {
-            if ("cat".equals(type)) {
+            if ("cat".equals(type) || "fox".equals(type)) {
                 paint.setShader(new LinearGradient(cx - dp(58), cy - dp(78), cx - dp(20), cy - dp(28), light, dark, Shader.TileMode.CLAMP));
                 Path left = new Path();
                 left.moveTo(cx - dp(38), cy - dp(28));
@@ -2778,6 +3502,13 @@ public class MainActivity extends Activity {
                 paint.setColor(Color.argb(115, 230, 169, 196));
                 canvas.drawOval(new RectF(cx - dp(27), cy - dp(98), cx - dp(15), cy - dp(48)), paint);
                 canvas.drawOval(new RectF(cx + dp(15), cy - dp(98), cx + dp(27), cy - dp(48)), paint);
+            } else if ("hamster".equals(type) || "panda".equals(type)) {
+                paint.setColor("panda".equals(type) ? Color.rgb(38, 45, 52) : dark);
+                canvas.drawCircle(cx - dp(40), cy - dp(38), dp(22), paint);
+                canvas.drawCircle(cx + dp(40), cy - dp(38), dp(22), paint);
+                paint.setColor("panda".equals(type) ? Color.rgb(245, 245, 240) : Color.rgb(255, 211, 178));
+                canvas.drawCircle(cx - dp(40), cy - dp(38), dp(10), paint);
+                canvas.drawCircle(cx + dp(40), cy - dp(38), dp(10), paint);
             } else {
                 paint.setShader(new RadialGradient(cx - dp(48), cy - dp(4), dp(34), light, dark, Shader.TileMode.CLAMP));
                 canvas.drawOval(new RectF(cx - dp(70), cy - dp(36), cx - dp(34), cy + dp(24)), paint);
@@ -2785,6 +3516,24 @@ public class MainActivity extends Activity {
                 canvas.drawOval(new RectF(cx + dp(34), cy - dp(36), cx + dp(70), cy + dp(24)), paint);
                 paint.setShader(null);
             }
+        }
+
+        private int petBaseColor() {
+            if ("dog".equals(type)) return Color.rgb(221, 165, 95);
+            if ("rabbit".equals(type)) return Color.rgb(248, 248, 244);
+            if ("fox".equals(type)) return Color.rgb(235, 130, 62);
+            if ("panda".equals(type)) return Color.rgb(244, 244, 238);
+            if ("hamster".equals(type)) return Color.rgb(226, 176, 112);
+            return Color.rgb(244, 188, 112);
+        }
+
+        private int petDetailColor() {
+            if ("dog".equals(type)) return Color.rgb(105, 72, 48);
+            if ("rabbit".equals(type)) return Color.rgb(214, 128, 170);
+            if ("fox".equals(type)) return Color.rgb(95, 54, 32);
+            if ("panda".equals(type)) return Color.rgb(38, 45, 52);
+            if ("hamster".equals(type)) return Color.rgb(124, 82, 48);
+            return Color.rgb(106, 74, 48);
         }
 
         private int lighten(int color, int amount) {
@@ -2964,5 +3713,19 @@ public class MainActivity extends Activity {
         if (name.contains("医") || name.contains("运动")) return "medical";
         if (name.contains("书") || name.contains("学") || name.contains("办")) return "book";
         return "other";
+    }
+
+    private static class AiDraft {
+        String raw;
+        String type = "expense";
+        long amount;
+        long categoryId;
+        String categoryName = "";
+        long accountId;
+        long targetAccountId;
+        long time;
+        String note = "";
+        boolean ready;
+        String missing = "";
     }
 }
