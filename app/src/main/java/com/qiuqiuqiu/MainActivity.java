@@ -10,6 +10,8 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RadialGradient;
@@ -813,7 +815,8 @@ public class MainActivity extends Activity {
             for (String path : images) {
                 ImageView iv = new ImageView(this);
                 iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                iv.setImageURI(Uri.fromFile(new File(path)));
+                File thumb = thumbFileFor(new File(path));
+                iv.setImageURI(Uri.fromFile(thumb.exists() ? thumb : new File(path)));
                 iv.setBackground(round(soft, dp(6)));
                 touchable(iv);
                 iv.setOnClickListener(v -> showImage(path));
@@ -920,7 +923,9 @@ public class MainActivity extends Activity {
         ImageView image = new ImageView(this);
         image.setAdjustViewBounds(true);
         image.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        image.setImageURI(Uri.fromFile(new File(path)));
+        Bitmap bitmap = decodeSampledBitmap(path, dp(360), dp(640));
+        if (bitmap != null) image.setImageBitmap(bitmap);
+        else image.setImageURI(Uri.fromFile(new File(path)));
         new AlertDialog.Builder(this)
                 .setView(image)
                 .setPositiveButton("关闭", null)
@@ -2114,23 +2119,28 @@ public class MainActivity extends Activity {
     }
 
     private void exportFullBackup(Uri uri) {
-        try {
-            consolidateAttachments();
-            checkpointDb();
-            OutputStream raw = getContentResolver().openOutputStream(uri);
-            if (raw == null) throw new Exception("no output");
-            ZipOutputStream zip = new ZipOutputStream(raw);
-            addFileToZip(zip, getDatabasePath(DbHelper.DB_NAME), "database/" + DbHelper.DB_NAME);
-            File receipts = new File(getFilesDir(), "receipts");
-            addDirToZip(zip, receipts, "receipts");
-            File sounds = new File(getFilesDir(), "sounds");
-            addDirToZip(zip, sounds, "sounds");
-            addTextToZip(zip, "settings/settings.json", settingsJson());
-            zip.close();
-            toast("完整备份已导出");
-        } catch (Exception e) {
-            toast("备份导出失败");
-        }
+        toast("正在后台导出完整备份");
+        new Thread(() -> {
+            boolean ok = false;
+            try {
+                consolidateAttachments();
+                checkpointDb();
+                OutputStream raw = getContentResolver().openOutputStream(uri);
+                if (raw == null) throw new Exception("no output");
+                ZipOutputStream zip = new ZipOutputStream(raw);
+                addFileToZip(zip, getDatabasePath(DbHelper.DB_NAME), "database/" + DbHelper.DB_NAME);
+                File receipts = new File(getFilesDir(), "receipts");
+                addDirToZip(zip, receipts, "receipts");
+                File sounds = new File(getFilesDir(), "sounds");
+                addDirToZip(zip, sounds, "sounds");
+                addTextToZip(zip, "settings/settings.json", settingsJson());
+                zip.close();
+                ok = true;
+            } catch (Exception ignored) {
+            }
+            boolean success = ok;
+            runOnUiThread(() -> toast(success ? "完整备份已导出" : "备份导出失败"));
+        }).start();
     }
 
     private void consolidateAttachments() {
@@ -2141,52 +2151,77 @@ public class MainActivity extends Activity {
             if (attachment.path == null || attachment.path.length() == 0) continue;
             File source = new File(attachment.path);
             if (!source.exists() || !source.isFile()) continue;
-            if (source.getAbsolutePath().startsWith(receiptsPath)) continue;
+            if (source.getAbsolutePath().startsWith(receiptsPath)) {
+                ensureReceiptThumbnail(source);
+                continue;
+            }
             File target = uniqueReceiptFile(source.getName());
             try {
                 copyFile(source, target);
+                ensureReceiptThumbnail(target);
                 db.updateAttachmentPath(attachment.id, target.getAbsolutePath());
             } catch (Exception ignored) {
             }
         }
     }
 
-    private void importFullBackup(Uri uri) {
-        File temp = new File(getCacheDir(), "backup_import");
+    private void ensureReceiptThumbnail(File imageFile) {
         try {
-            deleteRecursive(temp);
-            if (!temp.mkdirs()) throw new Exception("temp");
-            InputStream raw = getContentResolver().openInputStream(uri);
-            if (raw == null) throw new Exception("no input");
-            unzipTo(raw, temp);
-            raw.close();
-
-            File importedDb = new File(new File(temp, "database"), DbHelper.DB_NAME);
-            if (!importedDb.exists()) throw new Exception("missing db");
-            db.close();
-            copyFile(importedDb, getDatabasePath(DbHelper.DB_NAME));
-            deleteIfExists(new File(getDatabasePath(DbHelper.DB_NAME).getAbsolutePath() + "-wal"));
-            deleteIfExists(new File(getDatabasePath(DbHelper.DB_NAME).getAbsolutePath() + "-shm"));
-
-            File receipts = new File(getFilesDir(), "receipts");
-            deleteRecursive(receipts);
-            receipts.mkdirs();
-            File importedReceipts = new File(temp, "receipts");
-            copyDir(importedReceipts, receipts);
-            File sounds = new File(getFilesDir(), "sounds");
-            deleteRecursive(sounds);
-            sounds.mkdirs();
-            copyDir(new File(temp, "sounds"), sounds);
-            restoreSettings(new File(new File(temp, "settings"), "settings.json"));
-            db = new DbHelper(this);
-            db.normalizeAttachmentPaths(receipts.getAbsolutePath());
-            deleteRecursive(temp);
-            toast("完整备份已导入");
-            showHome();
-        } catch (Exception e) {
-            db = new DbHelper(this);
-            toast("备份导入失败");
+            File thumb = thumbFileFor(imageFile);
+            if (thumb.exists()) return;
+            Bitmap bitmap = decodeSampledBitmap(imageFile.getAbsolutePath(), 2048, 2048);
+            if (bitmap == null) return;
+            createReceiptThumbnail(imageFile, bitmap);
+            bitmap.recycle();
+        } catch (Exception ignored) {
         }
+    }
+
+    private void importFullBackup(Uri uri) {
+        toast("正在后台导入完整备份");
+        new Thread(() -> {
+            File temp = new File(getCacheDir(), "backup_import");
+            boolean ok = false;
+            try {
+                deleteRecursive(temp);
+                if (!temp.mkdirs()) throw new Exception("temp");
+                InputStream raw = getContentResolver().openInputStream(uri);
+                if (raw == null) throw new Exception("no input");
+                unzipTo(raw, temp);
+                raw.close();
+
+                File importedDb = new File(new File(temp, "database"), DbHelper.DB_NAME);
+                if (!importedDb.exists()) throw new Exception("missing db");
+                db.close();
+                copyFile(importedDb, getDatabasePath(DbHelper.DB_NAME));
+                deleteIfExists(new File(getDatabasePath(DbHelper.DB_NAME).getAbsolutePath() + "-wal"));
+                deleteIfExists(new File(getDatabasePath(DbHelper.DB_NAME).getAbsolutePath() + "-shm"));
+
+                File receipts = new File(getFilesDir(), "receipts");
+                deleteRecursive(receipts);
+                receipts.mkdirs();
+                File importedReceipts = new File(temp, "receipts");
+                copyDir(importedReceipts, receipts);
+                File sounds = new File(getFilesDir(), "sounds");
+                deleteRecursive(sounds);
+                sounds.mkdirs();
+                copyDir(new File(temp, "sounds"), sounds);
+                restoreSettings(new File(new File(temp, "settings"), "settings.json"));
+                db = new DbHelper(this);
+                db.normalizeAttachmentPaths(receipts.getAbsolutePath());
+                for (DbHelper.Attachment attachment : db.allAttachments()) ensureReceiptThumbnail(new File(attachment.path));
+                deleteRecursive(temp);
+                ok = true;
+            } catch (Exception ignored) {
+                db = new DbHelper(this);
+                deleteRecursive(temp);
+            }
+            boolean success = ok;
+            runOnUiThread(() -> {
+                toast(success ? "完整备份已导入" : "备份导入失败");
+                if (success) showHome();
+            });
+        }).start();
     }
 
     private void pickImage() {
@@ -2201,17 +2236,7 @@ public class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == PICK_IMAGE && resultCode == RESULT_OK && data != null && data.getData() != null) {
             try {
-                Uri uri = data.getData();
-                File dir = new File(getFilesDir(), "receipts");
-                if (!dir.exists()) dir.mkdirs();
-                File out = uniqueReceiptFile("receipt_" + System.currentTimeMillis() + ".jpg");
-                InputStream in = getContentResolver().openInputStream(uri);
-                FileOutputStream fos = new FileOutputStream(out);
-                byte[] buf = new byte[8192];
-                int len;
-                while (in != null && (len = in.read(buf)) > 0) fos.write(buf, 0, len);
-                if (in != null) in.close();
-                fos.close();
+                File out = storeReceiptImage(data.getData());
                 pendingImages.add(out.getAbsolutePath());
                 if (imageHint != null) imageHint.setText("已添加 " + pendingImages.size() + " 张图片");
             } catch (Exception e) {
@@ -3078,6 +3103,78 @@ public class MainActivity extends Activity {
             i++;
         } while (out.exists());
         return out;
+    }
+
+    private File storeReceiptImage(Uri uri) throws Exception {
+        Bitmap bitmap = decodeSampledBitmap(uri, 2048, 2048);
+        if (bitmap == null) throw new Exception("decode image");
+        File out = uniqueReceiptFile("receipt_" + System.currentTimeMillis() + ".jpg");
+        FileOutputStream fos = new FileOutputStream(out);
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 84, fos);
+        fos.close();
+        createReceiptThumbnail(out, bitmap);
+        bitmap.recycle();
+        return out;
+    }
+
+    private void createReceiptThumbnail(File imageFile, Bitmap source) throws Exception {
+        int max = dp(240);
+        int w = source.getWidth();
+        int h = source.getHeight();
+        float scale = Math.min(1f, max / (float) Math.max(w, h));
+        Bitmap thumb = scale < 1f ? Bitmap.createScaledBitmap(source, Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale)), true) : source;
+        File out = thumbFileFor(imageFile);
+        File parent = out.getParentFile();
+        if (parent != null && !parent.exists()) parent.mkdirs();
+        FileOutputStream fos = new FileOutputStream(out);
+        thumb.compress(Bitmap.CompressFormat.JPEG, 78, fos);
+        fos.close();
+        if (thumb != source) thumb.recycle();
+    }
+
+    private File thumbFileFor(File imageFile) {
+        File dir = new File(getFilesDir(), "receipts/thumbs");
+        if (!dir.exists()) dir.mkdirs();
+        return new File(dir, imageFile.getName());
+    }
+
+    private Bitmap decodeSampledBitmap(Uri uri, int reqW, int reqH) throws Exception {
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        InputStream bounds = getContentResolver().openInputStream(uri);
+        BitmapFactory.decodeStream(bounds, null, options);
+        if (bounds != null) bounds.close();
+        options.inSampleSize = calculateInSampleSize(options, reqW, reqH);
+        options.inJustDecodeBounds = false;
+        options.inPreferredConfig = Bitmap.Config.RGB_565;
+        InputStream data = getContentResolver().openInputStream(uri);
+        Bitmap bitmap = BitmapFactory.decodeStream(data, null, options);
+        if (data != null) data.close();
+        return bitmap;
+    }
+
+    private Bitmap decodeSampledBitmap(String path, int reqW, int reqH) {
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        BitmapFactory.decodeFile(path, options);
+        options.inSampleSize = calculateInSampleSize(options, reqW, reqH);
+        options.inJustDecodeBounds = false;
+        options.inPreferredConfig = Bitmap.Config.RGB_565;
+        return BitmapFactory.decodeFile(path, options);
+    }
+
+    private int calculateInSampleSize(BitmapFactory.Options options, int reqW, int reqH) {
+        int height = options.outHeight;
+        int width = options.outWidth;
+        int inSampleSize = 1;
+        if (height > reqH || width > reqW) {
+            int halfHeight = height / 2;
+            int halfWidth = width / 2;
+            while ((halfHeight / inSampleSize) >= reqH && (halfWidth / inSampleSize) >= reqW) {
+                inSampleSize *= 2;
+            }
+        }
+        return Math.max(1, inSampleSize);
     }
 
     private void copyDir(File from, File to) throws Exception {

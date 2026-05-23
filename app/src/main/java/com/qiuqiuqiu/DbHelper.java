@@ -14,7 +14,7 @@ import java.util.Locale;
 
 class DbHelper extends SQLiteOpenHelper {
     static final String DB_NAME = "xiaoqiu_accounting.db";
-    static final int DB_VERSION = 3;
+    static final int DB_VERSION = 4;
 
     DbHelper(Context context) {
         super(context, DB_NAME, null, DB_VERSION);
@@ -33,6 +33,9 @@ class DbHelper extends SQLiteOpenHelper {
         }
         if (oldVersion < 3) {
             seedMissingCategories(db);
+        }
+        if (oldVersion < 4) {
+            createIndexes(db);
         }
     }
 
@@ -54,6 +57,15 @@ class DbHelper extends SQLiteOpenHelper {
                 "id INTEGER PRIMARY KEY AUTOINCREMENT,transaction_id INTEGER NOT NULL,file_path TEXT NOT NULL,created_at INTEGER)");
         db.execSQL("CREATE TABLE budgets (" +
                 "id INTEGER PRIMARY KEY AUTOINCREMENT,budget_type TEXT NOT NULL,category_id INTEGER,month TEXT NOT NULL,amount INTEGER NOT NULL)");
+        createIndexes(db);
+    }
+
+    private void createIndexes(SQLiteDatabase db) {
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_transactions_deleted_time ON transactions(is_deleted, transaction_time)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_transactions_type_time ON transactions(type, transaction_time)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_transactions_category_time ON transactions(category_id, transaction_time)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_attachments_transaction ON attachments(transaction_id)");
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_budgets_type_month ON budgets(budget_type, month)");
     }
 
     private void ensureColumn(SQLiteDatabase db, String table, String column, String definition) {
